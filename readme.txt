@@ -37,6 +37,36 @@ Gains typiques :
 * Latence first-token sensiblement réduite
 * Aucune configuration requise
 
+== Prérequis MXChat (important) ==
+
+Sur MXChat Basic 3.2.6, le chat principal utilise `curl_exec`
+directement pour le streaming (ligne 8201 de
+`includes/class-mxchat-integrator.php`) et BYPASSE l'API HTTP
+WordPress. Ce code path n'est pas interceptable par
+`http_request_args` : le plugin ne peut donc rien faire tant que
+le streaming est actif.
+
+**Action requise** : désactiver le streaming dans les réglages
+MXChat (`MxChat → Settings`). Le chat tombe alors sur la branche
+fallback `mxchat_generate_response_claude` (ligne 8984), qui passe
+par `wp_remote_post` et est pleinement intercepté.
+
+Trade-off : perte de l'effet "machine à écrire" côté UX vs.
+~85-95 % de réduction du coût input une fois le cache chaud
+(typiquement 3-5 requêtes). Mesuré en conditions réelles sur
+Haiku 4.5 : 49 % de hit rate dès la 3e requête.
+
+Restent cacheables même avec streaming ON :
+
+* le Content Generator (admin) — `wp_remote_post`
+* le bouton "Test API" admin (one-shot) — `wp_remote_post`
+* le fallback streaming en cas d'erreur — `wp_remote_post`
+
+NON cacheable tant que la PR upstream n'est pas mergée :
+
+* le chat principal en mode streaming — `curl_exec` direct
+* le test admin "Test streaming" — `curl_exec` direct
+
 == Configuration optionnelle ==
 
 Une seule constante PHP, à définir dans `wp-config.php` si besoin :
@@ -90,14 +120,11 @@ Compteurs alimentés par le champ `usage` retourné par l'API Anthropic
 
 == Limites connues ==
 
-* **Flux streaming non couvert.** MXChat Basic utilise cURL directement
-  pour streamer les réponses du chat principal (voir
-  `class-mxchat-integrator.php` ligne ~8116). Ces appels contournent
-  l'API HTTP de WordPress et ne peuvent pas être interceptés par le
-  filtre `http_request_args`. Sont en revanche bien cachés :
-  - interprétation de la requête utilisateur (intent)
-  - génération de contenu (content generator)
-  - réponses non-streamées et fallbacks
+* **Streaming MXChat non interceptable** (voir section "Prérequis MXChat"
+  ci-dessus). Solution actuelle : désactiver le streaming dans les
+  réglages MXChat. Solution propre : PR upstream pour exposer un
+  filtre `mxchat_pre_claude_stream_payload` avant le `curl_setopt`
+  ligne 8119.
 
 * **Stabilité de l'historique.** Les breakpoints conversation supposent
   que MXChat envoie l'historique de façon stable (mêmes messages, même

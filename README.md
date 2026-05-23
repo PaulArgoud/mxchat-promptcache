@@ -20,6 +20,26 @@ Le prompt caching d'Anthropic réutilise les préfixes identiques entre requête
 - **TTFT sensiblement réduit** quand le préfixe vient du cache
 - **Zéro modification de MXChat** — tout passe par le filtre `http_request_args` de WordPress
 
+## Prérequis MXChat (important)
+
+Sur **MXChat Basic 3.2.6**, le chat principal utilise `curl_exec` directement pour le streaming (ligne 8201 de `includes/class-mxchat-integrator.php`) et **bypasse l'API HTTP WordPress**. Ce code path n'est pas interceptable par `http_request_args`, donc le plugin ne peut **rien faire** dessus tant que le streaming est actif.
+
+**Action requise** : désactiver le mode streaming dans les réglages MXChat (`MxChat → Settings`). Le chat tombe alors sur la branche fallback `mxchat_generate_response_claude` (ligne 8984), qui utilise `wp_remote_post` et est pleinement intercepté.
+
+**Trade-off** : perte de l'effet "machine à écrire" côté UX vs. **~85-95 % de réduction du coût input** une fois le cache chaud (typiquement 3-5 requêtes). Mesuré en conditions réelles sur Haiku 4.5 : 49 % de hit rate dès la 3e requête, convergence vers 90 %+ ensuite.
+
+Une issue/PR upstream serait envisageable pour exposer un filtre `mxchat_pre_claude_stream_payload` juste avant le `curl_setopt(CURLOPT_POSTFIELDS, ...)` ligne 8119 — ce qui permettrait de cacher même avec streaming ON. Patch de quelques lignes côté MXChat.
+
+### Ce qui est cacheable même avec streaming ON
+
+| Source | Méthode | Cacheable ? |
+|---|---|---|
+| Chat principal (streaming) | `curl_exec` | ✗ bypasse WP HTTP API |
+| Fallback non-streamé | `wp_remote_post` | ✓ |
+| Content Generator (admin) | `wp_remote_post` | ✓ |
+| Test "Test API" admin | `wp_remote_post` | ✓ (one-shot) |
+| Intent classification | `wp_remote_post` | ✓ techniquement, mais prompt trop court → sous le seuil min |
+
 ## Fonctionnement
 
 Le plugin hooke deux filtres WordPress :
@@ -149,7 +169,7 @@ Exemple de sortie `stats --total --by-model` :
 
 ## Limites connues
 
-- **Flux streaming non couvert.** MXChat Basic utilise cURL directement pour streamer les réponses du chat principal — ces appels contournent l'API HTTP de WordPress et ne sont pas interceptables par `http_request_args`. Les appels non-streamés (intent, content generator, fallbacks) sont bien cachés.
+- **Streaming MXChat non interceptable.** Voir la section [Prérequis MXChat](#prérequis-mxchat-important) ci-dessus. Solution actuelle : désactiver le streaming. Solution propre : PR upstream pour exposer un filtre avant le `curl_setopt` ligne 8119.
 - **Stabilité de l'historique.** Les breakpoints sur les messages supposent que MXChat envoie un historique stable d'un appel à l'autre. Reformater ou tronquer l'historique entre les tours invalide le cache.
 - **Idempotence.** Si une future version de MXChat ajoute nativement des `cache_control` sur l'historique, le plugin détecte leur présence et ne touche pas aux messages (mais continue à cacher `tools` et `system`).
 
