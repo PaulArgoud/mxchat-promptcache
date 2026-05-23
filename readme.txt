@@ -4,8 +4,9 @@ Tags: mxchat, anthropic, claude, cache, prompt-caching
 Requires at least: 5.8
 Tested up to: 6.5
 Requires PHP: 7.4
-Stable tag: 0.3.0
+Stable tag: 0.4.0
 License: GPLv2 or later
+License URI: https://www.gnu.org/licenses/gpl-2.0.html
 
 Active le prompt caching Anthropic sur les appels Claude du plugin MXChat
 Basic, sans modifier ses fichiers.
@@ -46,6 +47,17 @@ Une seule constante PHP, à définir dans `wp-config.php` si besoin :
 beta). À utiliser si votre compte Anthropic rejette le header
 `extended-cache-ttl-2025-04-11`.
 
+== Hooks d'extensibilité ==
+
+Trois filtres permettent d'ajuster le comportement sans forker :
+
+* `mxchat_pc_should_inject($should, $payload, $args, $url)` → désactiver
+  l'injection pour une requête spécifique.
+* `mxchat_pc_min_chars($min, $model, $payload)` → override du seuil
+  minimum (par modèle ou par requête).
+* `mxchat_pc_ephemeral_control($control)` → override de la valeur
+  `cache_control` injectée (ex : TTL custom).
+
 == Seuils minimum par modèle ==
 
 Anthropic ignore SILENCIEUSEMENT `cache_control` si le préfixe est trop
@@ -63,10 +75,14 @@ seuil :
 
 `wp mxchat-pc stats --by-model` → ventilation par modèle Anthropic.
 
+`wp mxchat-pc stats --total`    → cumulatif depuis l'installation + 24 h.
+
 `wp mxchat-pc debug`            → détails de la dernière requête (modèle,
                                   breakpoints ajoutés, usage retourné).
 
-`wp mxchat-pc reset`            → réinitialise compteurs et debug.
+`wp mxchat-pc reset`            → réinitialise compteurs 24 h et debug.
+
+`wp mxchat-pc reset --total`    → réinitialise aussi le cumulatif.
 
 Compteurs alimentés par le champ `usage` retourné par l'API Anthropic
 (`cache_read_input_tokens`, `cache_creation_input_tokens`,
@@ -99,6 +115,22 @@ Compteurs alimentés par le champ `usage` retourné par l'API Anthropic
 3. Vérifier après quelques requêtes : `wp mxchat-pc stats`.
 
 == Changelog ==
+
+= 0.4.0 =
+* Header de plugin complet : `Plugin URI`, `Author URI`, `Update URI`,
+  `Text Domain`, `Domain Path`.
+* Internationalisation (i18n) : toutes les chaînes user-facing wrappées
+  dans `__()` avec text-domain `mxchat-promptcache`.
+* Trois filters d'extensibilité : `mxchat_pc_should_inject`,
+  `mxchat_pc_min_chars`, `mxchat_pc_ephemeral_control`.
+* Statistiques cumulatives depuis l'installation (option `wp_option`
+  jamais expirée), exposées via `wp mxchat-pc stats --total`.
+* `wp mxchat-pc reset --total` pour reset complet.
+* Bail-out précoce sur les méthodes HTTP non-POST (évite un
+  `json_decode` inutile sur OPTIONS preflight, etc.).
+* `mxchat_pc_tools_size` : short-circuit quand le seuil est atteint
+  (mineur, utile sur les gros tool sets).
+* GitHub Actions CI : `php -l` sur PHP 7.4 / 8.0 / 8.1 / 8.2 / 8.3.
 
 = 0.3.0 =
 * **Fix critique** : seuils minimum corrigés pour Opus 4.x et Haiku 4.5

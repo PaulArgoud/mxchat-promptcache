@@ -1,11 +1,17 @@
 <?php
 /**
  * Plugin Name: MXChat Prompt Cache
+ * Plugin URI:  https://github.com/PaulArgoud/mxchat-promptcache
  * Description: Active le prompt caching Anthropic (tools + system + 2 derniers messages user, TTL 1h) sur les appels API du plugin MXChat Basic, sans modifier ses fichiers. Activation automatique. Métriques via WP-CLI.
- * Version: 0.3.0
+ * Version:     0.4.0
+ * Requires at least: 5.8
  * Requires PHP: 7.4
- * Author: Paul Argoud
- * License: GPL-2.0-or-later
+ * Author:      Paul Argoud
+ * Author URI:  https://github.com/PaulArgoud
+ * Update URI:  https://github.com/PaulArgoud/mxchat-promptcache
+ * Text Domain: mxchat-promptcache
+ * Domain Path: /languages
+ * License:     GPL-2.0-or-later
  */
 
 if (!defined('ABSPATH')) {
@@ -22,12 +28,19 @@ const MXCHAT_PC_MIN_CHARS_SONNET_LEGACY = 4000;  // 1024 tokens (Sonnet 4.5 et a
 const MXCHAT_PC_MIN_CHARS_DEFAULT       = 16400; // défaut sûr (modèle inconnu)
 
 const MXCHAT_PC_EXTENDED_TTL_HEADER = 'extended-cache-ttl-2025-04-11';
-const MXCHAT_PC_STATS_KEY           = 'mxchat_pc_stats';
-const MXCHAT_PC_DEBUG_KEY           = 'mxchat_pc_last_debug';
+const MXCHAT_PC_STATS_KEY           = 'mxchat_pc_stats';        // transient 24h glissant
+const MXCHAT_PC_STATS_TOTAL_KEY     = 'mxchat_pc_stats_total';  // option cumulative
+const MXCHAT_PC_DEBUG_KEY           = 'mxchat_pc_last_debug';   // transient 1h
 const MXCHAT_PC_MAX_BREAKPOINTS     = 4;
+const MXCHAT_PC_MIN_MESSAGES        = 3; // (user, assistant, user) min pour activer le cache historique
 
+add_action('init', 'mxchat_pc_load_textdomain');
 add_filter('http_request_args', 'mxchat_pc_inject_cache_control', 10, 2);
 add_filter('http_response', 'mxchat_pc_record_metrics', 10, 3);
+
+function mxchat_pc_load_textdomain() {
+    load_plugin_textdomain('mxchat-promptcache', false, dirname(plugin_basename(__FILE__)) . '/languages');
+}
 
 /** Strict host+path match. */
 function mxchat_pc_is_anthropic_messages_url($url) {
@@ -79,16 +92,24 @@ function mxchat_pc_blocks_have_cache_control($blocks) {
     return false;
 }
 
-/** TTL 1h par défaut, fallback 5min si l'utilisateur opt-out via constante. */
+/** TTL 1h par défaut, fallback 5min si l'utilisateur opt-out via constante. Filtrable. */
 function mxchat_pc_ephemeral_control() {
     if (defined('MXCHAT_PC_EXTENDED_TTL') && MXCHAT_PC_EXTENDED_TTL === false) {
-        return ['type' => 'ephemeral'];
+        $control = ['type' => 'ephemeral'];
+    } else {
+        $control = ['type' => 'ephemeral', 'ttl' => '1h'];
     }
-    return ['type' => 'ephemeral', 'ttl' => '1h'];
+    /**
+     * Filtre la structure cache_control envoyée à Anthropic.
+     *
+     * @param array $control Tableau {type, ttl?}.
+     */
+    return apply_filters('mxchat_pc_ephemeral_control', $control);
 }
 
 function mxchat_pc_using_extended_ttl() {
-    return !(defined('MXCHAT_PC_EXTENDED_TTL') && MXCHAT_PC_EXTENDED_TTL === false);
+    $control = mxchat_pc_ephemeral_control();
+    return isset($control['ttl']) && $control['ttl'] === '1h';
 }
 
 /** Taille texte cumulée du bloc system (chaîne ou array de blocs). */
@@ -108,8 +129,11 @@ function mxchat_pc_system_size($system) {
     return $total;
 }
 
-/** Taille cumulée des définitions tools (name + description + input_schema sérialisé). */
-function mxchat_pc_tools_size($tools) {
+/**
+ * Taille cumulée des définitions tools (name + description + input_schema sérialisé).
+ * Le paramètre $stop_at court-circuite la mesure dès que le seuil est atteint.
+ */
+function mxchat_pc_tools_size($tools, $stop_at = PHP_INT_MAX) {
     if (!is_array($tools)) {
         return 0;
     }
@@ -129,6 +153,9 @@ function mxchat_pc_tools_size($tools) {
             if (is_string($encoded)) {
                 $total += strlen($encoded);
             }
+        }
+        if ($total >= $stop_at) {
+            return $total;
         }
     }
     return $total;
@@ -172,6 +199,13 @@ function mxchat_pc_inject_cache_control($args, $url) {
     if (!mxchat_pc_is_anthropic_messages_url($url)) {
         return $args;
     }
+
+    // Bail-out précoce : seules les requêtes POST nous intéressent (OPTIONS preflight, etc.).
+    $method = isset($args['method']) ? strtoupper($args['method']) : 'GET';
+    if ($method !== 'POST') {
+        return $args;
+    }
+
     if (empty($args['body']) || !is_string($args['body'])) {
         return $args;
     }
@@ -181,11 +215,33 @@ function mxchat_pc_inject_cache_control($args, $url) {
         return $args;
     }
 
+    /**
+     * Permet de désactiver l'injection pour une requête spécifique.
+     *
+     * @param bool   $should  true par défaut.
+     * @param array  $payload Payload décodé envoyé à Anthropic.
+     * @param array  $args    Arguments HTTP WordPress.
+     * @param string $url     URL cible.
+     */
+    if (!apply_filters('mxchat_pc_should_inject', true, $payload, $args, $url)) {
+        return $args;
+    }
+
     $model     = isset($payload['model']) && is_string($payload['model']) ? $payload['model'] : '';
     $min_chars = mxchat_pc_min_chars_for_model($model);
-    $mutated   = false;
-    $used      = 0;
-    $debug     = [
+
+    /**
+     * Filtre le seuil minimum (en caractères) pour qu'un bloc soit marqué cacheable.
+     *
+     * @param int    $min_chars Seuil par défaut basé sur le modèle.
+     * @param string $model     Nom du modèle Anthropic envoyé dans la requête.
+     * @param array  $payload   Payload décodé.
+     */
+    $min_chars = (int) apply_filters('mxchat_pc_min_chars', $min_chars, $model, $payload);
+
+    $mutated = false;
+    $used    = 0;
+    $debug   = [
         'time'        => time(),
         'model'       => $model,
         'min_chars'   => $min_chars,
@@ -204,7 +260,7 @@ function mxchat_pc_inject_cache_control($args, $url) {
         && !empty($payload['tools'])
         && is_array($payload['tools'])
         && !mxchat_pc_blocks_have_cache_control($payload['tools'])
-        && mxchat_pc_tools_size($payload['tools']) >= $min_chars
+        && mxchat_pc_tools_size($payload['tools'], $min_chars) >= $min_chars
     ) {
         $last = count($payload['tools']) - 1;
         if (is_array($payload['tools'][$last])) {
@@ -245,11 +301,15 @@ function mxchat_pc_inject_cache_control($args, $url) {
     // Le dernier user = écriture du cache. L'avant-dernier user = lecture au prochain tour
     // (il était le "dernier" lors de la requête précédente). Cette stratégie maintient
     // un hit rate stable même quand la conversation s'allonge.
+    //
+    // Seuil minimum de MXCHAT_PC_MIN_MESSAGES messages : il faut au moins
+    // (user, assistant, user) pour avoir un préfixe stable cachable + un point de lecture
+    // potentiel au tour suivant.
     if (
         $used < MXCHAT_PC_MAX_BREAKPOINTS
         && !empty($payload['messages'])
         && is_array($payload['messages'])
-        && count($payload['messages']) >= 3
+        && count($payload['messages']) >= MXCHAT_PC_MIN_MESSAGES
     ) {
         $already_cached = false;
         foreach ($payload['messages'] as $msg) {
@@ -262,8 +322,8 @@ function mxchat_pc_inject_cache_control($args, $url) {
         }
 
         if (!$already_cached) {
-            $user_idx           = mxchat_pc_last_user_indexes($payload['messages'], 2);
-            $slots_remaining    = MXCHAT_PC_MAX_BREAKPOINTS - $used;
+            $user_idx        = mxchat_pc_last_user_indexes($payload['messages'], 2);
+            $slots_remaining = MXCHAT_PC_MAX_BREAKPOINTS - $used;
 
             // Avant-dernier user d'abord (ordre logique du préfixe).
             if ($slots_remaining >= 2 && isset($user_idx[1])) {
@@ -313,7 +373,7 @@ function mxchat_pc_inject_cache_control($args, $url) {
     return $args;
 }
 
-/** Accumule les stats hit/miss dans un transient (24 h, rolling), ventilées par modèle. */
+/** Accumule les stats hit/miss : transient 24 h (rolling, ventilé par modèle) + option cumulative. */
 function mxchat_pc_record_metrics($response, $args, $url) {
     if (!mxchat_pc_is_anthropic_messages_url($url)) {
         return $response;
@@ -328,8 +388,12 @@ function mxchat_pc_record_metrics($response, $args, $url) {
         return $response;
     }
 
-    $model = isset($data['model']) && is_string($data['model']) ? $data['model'] : 'unknown';
+    $model          = isset($data['model']) && is_string($data['model']) ? $data['model'] : 'unknown';
+    $cache_creation = (int) ($data['usage']['cache_creation_input_tokens'] ?? 0);
+    $cache_read     = (int) ($data['usage']['cache_read_input_tokens'] ?? 0);
+    $input          = (int) ($data['usage']['input_tokens'] ?? 0);
 
+    // --- Stats 24h glissantes (transient, ventilées par modèle).
     $stats = get_transient(MXCHAT_PC_STATS_KEY);
     if (!is_array($stats)) {
         $stats = [
@@ -353,10 +417,6 @@ function mxchat_pc_record_metrics($response, $args, $url) {
         ];
     }
 
-    $cache_creation = (int) ($data['usage']['cache_creation_input_tokens'] ?? 0);
-    $cache_read     = (int) ($data['usage']['cache_read_input_tokens'] ?? 0);
-    $input          = (int) ($data['usage']['input_tokens'] ?? 0);
-
     $stats['requests']++;
     $stats['cache_creation_tokens'] += $cache_creation;
     $stats['cache_read_tokens']     += $cache_read;
@@ -369,7 +429,24 @@ function mxchat_pc_record_metrics($response, $args, $url) {
 
     set_transient(MXCHAT_PC_STATS_KEY, $stats, DAY_IN_SECONDS);
 
-    // Best-effort : enrichit l'enregistrement debug courant avec la réponse correspondante.
+    // --- Stats cumulatives (option non-autoloadée, jamais expirée).
+    $total = get_option(MXCHAT_PC_STATS_TOTAL_KEY, null);
+    if (!is_array($total)) {
+        $total = [
+            'requests'              => 0,
+            'cache_creation_tokens' => 0,
+            'cache_read_tokens'     => 0,
+            'input_tokens'          => 0,
+            'since'                 => time(),
+        ];
+    }
+    $total['requests']++;
+    $total['cache_creation_tokens'] += $cache_creation;
+    $total['cache_read_tokens']     += $cache_read;
+    $total['input_tokens']          += $input;
+    update_option(MXCHAT_PC_STATS_TOTAL_KEY, $total, false);
+
+    // --- Enrichit le debug de la dernière requête (best-effort).
     $debug = get_transient(MXCHAT_PC_DEBUG_KEY);
     if (is_array($debug)) {
         $debug['response_model'] = $model;
@@ -384,7 +461,7 @@ function mxchat_pc_record_metrics($response, $args, $url) {
     return $response;
 }
 
-// --- WP-CLI : `wp mxchat-pc stats [--by-model]` / `reset` / `debug` ---
+// --- WP-CLI : `wp mxchat-pc stats [--by-model] [--total]` / `reset [--total]` / `debug` ---
 if (defined('WP_CLI') && WP_CLI) {
     class MXChat_PC_CLI {
         /**
@@ -393,19 +470,37 @@ if (defined('WP_CLI') && WP_CLI) {
          * ## OPTIONS
          *
          * [--by-model]
-         * : Ajoute un récapitulatif par modèle Anthropic.
+         * : Ajoute un récapitulatif par modèle Anthropic (sur la fenêtre 24 h).
+         *
+         * [--total]
+         * : Affiche également les statistiques cumulatives depuis l'installation.
          */
         public function stats($args, $assoc_args) {
+            $show_total    = !empty($assoc_args['total']);
+            $show_by_model = !empty($assoc_args['by-model']);
+
+            if ($show_total) {
+                $total = get_option(MXCHAT_PC_STATS_TOTAL_KEY, null);
+                if (!is_array($total)) {
+                    WP_CLI::log(__('Aucune statistique cumulative enregistrée.', 'mxchat-promptcache'));
+                } else {
+                    $this->print_block(__('Cumulatif (depuis installation)', 'mxchat-promptcache'), $total, true);
+                }
+            }
+
             $stats = get_transient(MXCHAT_PC_STATS_KEY);
             if (!is_array($stats)) {
-                WP_CLI::log('Aucune statistique enregistrée.');
+                WP_CLI::log(__('Aucune statistique 24 h enregistrée.', 'mxchat-promptcache'));
                 return;
             }
 
-            $this->print_block('Global', $stats, true);
+            $label = $show_total
+                ? __('Glissant 24 h', 'mxchat-promptcache')
+                : __('Global (24 h glissantes)', 'mxchat-promptcache');
+            $this->print_block($label, $stats, true);
 
-            if (!empty($assoc_args['by-model']) && !empty($stats['per_model'])) {
-                WP_CLI::log("\n--- Détail par modèle ---");
+            if ($show_by_model && !empty($stats['per_model'])) {
+                WP_CLI::log("\n--- " . __('Détail par modèle (24 h)', 'mxchat-promptcache') . ' ---');
                 foreach ($stats['per_model'] as $model => $m) {
                     $this->print_block($model, $m, false);
                 }
@@ -422,54 +517,72 @@ if (defined('WP_CLI') && WP_CLI) {
 
             $lines = [
                 sprintf("\n[%s]", $label),
-                sprintf("  Requêtes              : %d", $requests),
-                sprintf("  Tokens lus du cache   : %d", $cached),
-                sprintf("  Tokens écrits cache   : %d", $creation),
-                sprintf("  Tokens entrée bruts   : %d", $input),
-                sprintf("  Taux de hit (cache)   : %.1f %%", $hit_rate),
+                sprintf(__('  Requêtes              : %d', 'mxchat-promptcache'), $requests),
+                sprintf(__('  Tokens lus du cache   : %d', 'mxchat-promptcache'), $cached),
+                sprintf(__('  Tokens écrits cache   : %d', 'mxchat-promptcache'), $creation),
+                sprintf(__('  Tokens entrée bruts   : %d', 'mxchat-promptcache'), $input),
+                sprintf(__('  Taux de hit (cache)   : %.1f %%', 'mxchat-promptcache'), $hit_rate),
             ];
             if ($with_since && isset($s['since'])) {
-                $lines[] = sprintf("  Depuis                : %s", date('Y-m-d H:i:s', (int) $s['since']));
+                $lines[] = sprintf(
+                    __('  Depuis                : %s', 'mxchat-promptcache'),
+                    date('Y-m-d H:i:s', (int) $s['since'])
+                );
             }
             WP_CLI::log(implode("\n", $lines));
         }
 
-        /** Réinitialise statistiques et debug. */
-        public function reset() {
+        /**
+         * Réinitialise les statistiques 24 h et le debug.
+         *
+         * ## OPTIONS
+         *
+         * [--total]
+         * : Réinitialise également les statistiques cumulatives depuis l'installation.
+         */
+        public function reset($args, $assoc_args) {
             delete_transient(MXCHAT_PC_STATS_KEY);
             delete_transient(MXCHAT_PC_DEBUG_KEY);
-            WP_CLI::success('Statistiques et debug réinitialisés.');
+            if (!empty($assoc_args['total'])) {
+                delete_option(MXCHAT_PC_STATS_TOTAL_KEY);
+                WP_CLI::success(__('Statistiques (24 h + cumulatives) et debug réinitialisés.', 'mxchat-promptcache'));
+            } else {
+                WP_CLI::success(__('Statistiques 24 h et debug réinitialisés.', 'mxchat-promptcache'));
+            }
         }
 
         /** Affiche les détails de la dernière requête interceptée (transient 1 h). */
         public function debug() {
             $debug = get_transient(MXCHAT_PC_DEBUG_KEY);
             if (!is_array($debug)) {
-                WP_CLI::log('Aucune donnée de debug (transient expiré ou aucune requête récente).');
+                WP_CLI::log(__('Aucune donnée de debug (transient expiré ou aucune requête récente).', 'mxchat-promptcache'));
                 return;
             }
             WP_CLI::log(sprintf(
-                "Dernière requête  : %s\n" .
-                "Modèle (request)  : %s\n" .
-                "Modèle (réponse)  : %s\n" .
-                "Seuil min (chars) : %d\n" .
-                "Breakpoints ajoutés :\n" .
-                "  - tools     : %s\n" .
-                "  - system    : %s\n" .
-                "  - prev_user : %s\n" .
-                "  - last_user : %s\n" .
-                "Usage (tokens) :\n" .
-                "  - input                 : %d\n" .
-                "  - cache_creation_input  : %d\n" .
-                "  - cache_read_input      : %d",
+                __(
+                    "Dernière requête  : %s\n" .
+                    "Modèle (request)  : %s\n" .
+                    "Modèle (réponse)  : %s\n" .
+                    "Seuil min (chars) : %d\n" .
+                    "Breakpoints ajoutés :\n" .
+                    "  - tools     : %s\n" .
+                    "  - system    : %s\n" .
+                    "  - prev_user : %s\n" .
+                    "  - last_user : %s\n" .
+                    "Usage (tokens) :\n" .
+                    "  - input                 : %d\n" .
+                    "  - cache_creation_input  : %d\n" .
+                    "  - cache_read_input      : %d",
+                    'mxchat-promptcache'
+                ),
                 date('Y-m-d H:i:s', (int) ($debug['time'] ?? 0)),
                 $debug['model'] ?? '—',
                 $debug['response_model'] ?? '—',
                 (int) ($debug['min_chars'] ?? 0),
-                !empty($debug['breakpoints']['tools'])     ? 'oui' : 'non',
-                !empty($debug['breakpoints']['system'])    ? 'oui' : 'non',
-                !empty($debug['breakpoints']['prev_user']) ? 'oui' : 'non',
-                !empty($debug['breakpoints']['last_user']) ? 'oui' : 'non',
+                !empty($debug['breakpoints']['tools'])     ? __('oui', 'mxchat-promptcache') : __('non', 'mxchat-promptcache'),
+                !empty($debug['breakpoints']['system'])    ? __('oui', 'mxchat-promptcache') : __('non', 'mxchat-promptcache'),
+                !empty($debug['breakpoints']['prev_user']) ? __('oui', 'mxchat-promptcache') : __('non', 'mxchat-promptcache'),
+                !empty($debug['breakpoints']['last_user']) ? __('oui', 'mxchat-promptcache') : __('non', 'mxchat-promptcache'),
                 (int) ($debug['usage']['input_tokens'] ?? 0),
                 (int) ($debug['usage']['cache_creation_input_tokens'] ?? 0),
                 (int) ($debug['usage']['cache_read_input_tokens'] ?? 0)

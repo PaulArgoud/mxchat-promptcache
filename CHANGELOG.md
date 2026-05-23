@@ -4,6 +4,29 @@ Toutes les modifications notables sont consignées ici.
 
 Le format suit [Keep a Changelog](https://keepachangelog.com/fr/1.1.0/), et ce projet adhère à [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.4.0] - 2026-05-23
+
+### Added
+
+- **Header de plugin complet** : `Plugin URI`, `Author URI`, `Update URI`, `Text Domain`, `Domain Path`, `Requires at least`.
+- **Internationalisation (i18n)** : chargement du text-domain `mxchat-promptcache` sur `init`, toutes les chaînes user-facing (commandes WP-CLI) wrappées dans `__()`. Le `.pot` peut être généré via `wp i18n make-pot . languages/mxchat-promptcache.pot`.
+- **Trois filters d'extensibilité** (évitent les forks utilisateur) :
+  - `mxchat_pc_should_inject($should, $payload, $args, $url)` — désactiver l'injection pour une requête spécifique.
+  - `mxchat_pc_min_chars($min, $model, $payload)` — override du seuil minimum par modèle ou par requête.
+  - `mxchat_pc_ephemeral_control($control)` — override de la structure `cache_control` injectée (ex : TTL custom).
+- **Statistiques cumulatives** depuis l'installation (option `mxchat_pc_stats_total`, non-autoloadée, jamais expirée).
+- **`wp mxchat-pc stats --total`** : affiche le cumulatif depuis l'installation en plus du glissant 24 h.
+- **`wp mxchat-pc reset --total`** : reset complet (24 h + cumulatif + debug).
+- **GitHub Actions CI** : `php -l` sur PHP 7.4 / 8.0 / 8.1 / 8.2 / 8.3 à chaque push et PR.
+- **Badges README** : release, license, PHP, WordPress, CI.
+
+### Changed
+
+- **Bail-out précoce** sur les méthodes HTTP non-POST (évite un `json_decode` inutile sur OPTIONS preflight et autres requêtes hors scope).
+- **`mxchat_pc_tools_size`** : nouveau paramètre `$stop_at` qui court-circuite la mesure dès que le seuil est dépassé (optimisation marginale sur les très gros tool sets).
+- **`mxchat_pc_using_extended_ttl`** se base désormais sur la sortie de `mxchat_pc_ephemeral_control()` (cohérent avec le filtre).
+- Constante explicite `MXCHAT_PC_MIN_MESSAGES = 3` pour documenter le seuil d'activation du cache historique.
+
 ## [0.3.0] - 2026-05-23
 
 ### Fixed

@@ -1,8 +1,14 @@
 # MXChat Prompt Cache
 
+[![Latest release](https://img.shields.io/github/v/release/PaulArgoud/mxchat-promptcache)](https://github.com/PaulArgoud/mxchat-promptcache/releases/latest)
+[![License: GPL-2.0+](https://img.shields.io/badge/license-GPL--2.0%2B-blue)](https://www.gnu.org/licenses/gpl-2.0.html)
+[![PHP](https://img.shields.io/badge/PHP-7.4%2B-777bb4)](https://www.php.net/)
+[![WordPress](https://img.shields.io/badge/WordPress-5.8%2B-21759b)](https://wordpress.org/)
+[![CI](https://github.com/PaulArgoud/mxchat-promptcache/actions/workflows/ci.yml/badge.svg)](https://github.com/PaulArgoud/mxchat-promptcache/actions/workflows/ci.yml)
+
 Plugin WordPress qui active automatiquement le [prompt caching Anthropic](https://docs.claude.com/en/docs/build-with-claude/prompt-caching) sur les appels API du plugin **MXChat Basic**, sans modifier ses fichiers.
 
-> Stable tag : **0.3.0** — PHP 7.4+ — WordPress 5.8+
+> Stable tag : **0.4.0** — PHP 7.4+ — WordPress 5.8+
 
 ## Pourquoi
 
@@ -20,7 +26,7 @@ Le plugin hooke deux filtres WordPress :
 
 | Filtre | Rôle |
 |---|---|
-| `http_request_args` | Détecte les requêtes vers `api.anthropic.com/v1/messages`, injecte les `cache_control` et le header beta TTL 1h |
+| `http_request_args` | Détecte les requêtes POST vers `api.anthropic.com/v1/messages`, injecte les `cache_control` et le header beta TTL 1h |
 | `http_response` | Extrait `usage.cache_*_input_tokens` de la réponse, accumule les stats |
 
 ### Stratégie de breakpoints (4 max imposés par Anthropic)
@@ -49,7 +55,7 @@ Anthropic ignore silencieusement `cache_control` quand le préfixe est trop cour
 
 ```bash
 cd wp-content/plugins/
-git clone https://github.com/<ton-handle>/mxchat-promptcache.git
+git clone https://github.com/PaulArgoud/mxchat-promptcache.git
 wp plugin activate mxchat-promptcache
 ```
 
@@ -72,6 +78,30 @@ define('MXCHAT_PC_EXTENDED_TTL', false);
 
 À utiliser uniquement si ton compte Anthropic rejette le header beta `extended-cache-ttl-2025-04-11`.
 
+### Filters d'extensibilité
+
+Trois hooks WordPress permettent d'ajuster le comportement sans forker :
+
+```php
+// Désactiver l'injection pour une requête spécifique
+add_filter('mxchat_pc_should_inject', function ($should, $payload, $args, $url) {
+    if (($payload['metadata']['user_id'] ?? '') === 'no-cache-user') {
+        return false;
+    }
+    return $should;
+}, 10, 4);
+
+// Override du seuil minimum (par modèle ou par requête)
+add_filter('mxchat_pc_min_chars', function ($min, $model, $payload) {
+    return $model === 'claude-haiku-4-5' ? 12000 : $min;
+}, 10, 3);
+
+// Override de la valeur cache_control (ex: TTL custom)
+add_filter('mxchat_pc_ephemeral_control', function ($control) {
+    return ['type' => 'ephemeral']; // force TTL 5min
+});
+```
+
 ## Utilisation (WP-CLI)
 
 ```bash
@@ -81,23 +111,40 @@ wp mxchat-pc stats
 # Ventilation par modèle Anthropic
 wp mxchat-pc stats --by-model
 
+# Cumulatif depuis l'installation + 24h glissantes
+wp mxchat-pc stats --total
+
 # Détails de la dernière requête (breakpoints, modèle, usage)
 wp mxchat-pc debug
 
-# Reset des compteurs
+# Reset des compteurs 24h + debug
 wp mxchat-pc reset
+
+# Reset complet (24h + cumulatif + debug)
+wp mxchat-pc reset --total
 ```
 
-Exemple de sortie `stats` :
+Exemple de sortie `stats --total --by-model` :
 
 ```
-[Global]
+[Cumulatif (depuis installation)]
+  Requêtes              : 12480
+  Tokens lus du cache   : 98 421 100
+  Tokens écrits cache   : 4 312 800
+  Tokens entrée bruts   : 8 920 400
+  Taux de hit (cache)   : 88.0 %
+  Depuis                : 2026-04-01 10:00:00
+
+[Glissant 24 h]
   Requêtes              : 142
-  Tokens lus du cache   : 1245300
-  Tokens écrits cache   : 87500
-  Tokens entrée bruts   : 124800
-  Taux de hit (cache)   : 85.4 %
-  Depuis                : 2026-05-22 14:32:18
+  Tokens lus du cache   : 1 245 300
+  ...
+
+--- Détail par modèle (24 h) ---
+
+[claude-sonnet-4-6]
+  Requêtes              : 98
+  ...
 ```
 
 ## Limites connues
@@ -109,9 +156,17 @@ Exemple de sortie `stats` :
 ## Compatibilité
 
 - WordPress 5.8+
-- PHP 7.4+
+- PHP 7.4 → 8.3 (CI testée sur 7.4 / 8.0 / 8.1 / 8.2 / 8.3)
 - MXChat Basic (toutes versions — le plugin n'introspecte pas MXChat)
 - Tous les modèles Anthropic supportant le prompt caching (GA sur l'ensemble du catalogue actuel)
+
+## Internationalisation
+
+Le plugin est prêt pour la traduction (`Text Domain: mxchat-promptcache`, `Domain Path: /languages`). Les chaînes user-facing (WP-CLI) sont wrappées dans `__()`. Le fichier `.pot` peut être généré via :
+
+```bash
+wp i18n make-pot . languages/mxchat-promptcache.pot
+```
 
 ## Changelog
 
